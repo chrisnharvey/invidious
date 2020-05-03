@@ -16,7 +16,7 @@ jobs:
     - uses: actions/checkout@v1
 
     - name: Build the Docker image
-      run: docker build -t chrisnharvey/invidious-private:latest ./docker
+      run: docker build -t chrisnharvey/invidious-private:latest -f ./docker/Dockerfile .
 
     - uses: azure/docker-login@v1
       with:
