@@ -1,22 +1,35 @@
 struct InvidiousChannel
-  db_mapping({
-    id:         String,
-    author:     String,
-    updated:    Time,
-    deleted:    Bool,
-    subscribed: Time?,
-  })
+  include DB::Serializable
+
+  property id : String
+  property author : String
+  property updated : Time
+  property deleted : Bool
+  property subscribed : Time?
 end
 
 struct ChannelVideo
-  def to_json(locale, config, kemal_config, json : JSON::Builder)
+  include DB::Serializable
+
+  property id : String
+  property title : String
+  property published : Time
+  property updated : Time
+  property ucid : String
+  property author : String
+  property length_seconds : Int32 = 0
+  property live_now : Bool = false
+  property premiere_timestamp : Time? = nil
+  property views : Int64? = nil
+
+  def to_json(locale, json : JSON::Builder)
     json.object do
       json.field "type", "shortVideo"
 
       json.field "title", self.title
       json.field "videoId", self.id
       json.field "videoThumbnails" do
-        generate_thumbnails(json, self.id, config, Kemal.config)
+        generate_thumbnails(json, self.id)
       end
 
       json.field "lengthSeconds", self.length_seconds
@@ -31,17 +44,17 @@ struct ChannelVideo
     end
   end
 
-  def to_json(locale, config, kemal_config, json : JSON::Builder | Nil = nil)
+  def to_json(locale, json : JSON::Builder | Nil = nil)
     if json
-      to_json(locale, config, kemal_config, json)
+      to_json(locale, json)
     else
       JSON.build do |json|
-        to_json(locale, config, kemal_config, json)
+        to_json(locale, json)
       end
     end
   end
 
-  def to_xml(locale, host_url, query_params, xml : XML::Builder)
+  def to_xml(locale, query_params, xml : XML::Builder)
     query_params["v"] = self.id
 
     xml.element("entry") do
@@ -49,17 +62,17 @@ struct ChannelVideo
       xml.element("yt:videoId") { xml.text self.id }
       xml.element("yt:channelId") { xml.text self.ucid }
       xml.element("title") { xml.text self.title }
-      xml.element("link", rel: "alternate", href: "#{host_url}/watch?#{query_params}")
+      xml.element("link", rel: "alternate", href: "#{HOST_URL}/watch?#{query_params}")
 
       xml.element("author") do
         xml.element("name") { xml.text self.author }
-        xml.element("uri") { xml.text "#{host_url}/channel/#{self.ucid}" }
+        xml.element("uri") { xml.text "#{HOST_URL}/channel/#{self.ucid}" }
       end
 
       xml.element("content", type: "xhtml") do
         xml.element("div", xmlns: "http://www.w3.org/1999/xhtml") do
-          xml.element("a", href: "#{host_url}/watch?#{query_params}") do
-            xml.element("img", src: "#{host_url}/vi/#{self.id}/mqdefault.jpg")
+          xml.element("a", href: "#{HOST_URL}/watch?#{query_params}") do
+            xml.element("img", src: "#{HOST_URL}/vi/#{self.id}/mqdefault.jpg")
           end
         end
       end
@@ -69,64 +82,51 @@ struct ChannelVideo
 
       xml.element("media:group") do
         xml.element("media:title") { xml.text self.title }
-        xml.element("media:thumbnail", url: "#{host_url}/vi/#{self.id}/mqdefault.jpg",
+        xml.element("media:thumbnail", url: "#{HOST_URL}/vi/#{self.id}/mqdefault.jpg",
           width: "320", height: "180")
       end
     end
   end
 
-  def to_xml(locale, config, kemal_config, xml : XML::Builder | Nil = nil)
+  def to_xml(locale, xml : XML::Builder | Nil = nil)
     if xml
-      to_xml(locale, config, kemal_config, xml)
+      to_xml(locale, xml)
     else
       XML.build do |xml|
-        to_xml(locale, config, kemal_config, xml)
+        to_xml(locale, xml)
       end
     end
   end
-
-  db_mapping({
-    id:                 String,
-    title:              String,
-    published:          Time,
-    updated:            Time,
-    ucid:               String,
-    author:             String,
-    length_seconds:     {type: Int32, default: 0},
-    live_now:           {type: Bool, default: false},
-    premiere_timestamp: {type: Time?, default: nil},
-    views:              {type: Int64?, default: nil},
-  })
 end
 
 struct AboutRelatedChannel
-  db_mapping({
-    ucid:             String,
-    author:           String,
-    author_url:       String,
-    author_thumbnail: String,
-  })
+  include DB::Serializable
+
+  property ucid : String
+  property author : String
+  property author_url : String
+  property author_thumbnail : String
 end
 
 # TODO: Refactor into either SearchChannel or InvidiousChannel
 struct AboutChannel
-  db_mapping({
-    ucid:               String,
-    author:             String,
-    auto_generated:     Bool,
-    author_url:         String,
-    author_thumbnail:   String,
-    banner:             String?,
-    description_html:   String,
-    paid:               Bool,
-    total_views:        Int64,
-    sub_count:          Int32,
-    joined:             Time,
-    is_family_friendly: Bool,
-    allowed_regions:    Array(String),
-    related_channels:   Array(AboutRelatedChannel),
-    tabs:               Array(String),
-  })
+  include DB::Serializable
+
+  property ucid : String
+  property author : String
+  property auto_generated : Bool
+  property author_url : String
+  property author_thumbnail : String
+  property banner : String?
+  property description_html : String
+  property paid : Bool
+  property total_views : Int64
+  property sub_count : Int32
+  property joined : Time
+  property is_family_friendly : Bool
+  property allowed_regions : Array(String)
+  property related_channels : Array(AboutRelatedChannel)
+  property tabs : Array(String)
 end
 
 class ChannelRedirect < Exception
@@ -216,29 +216,17 @@ def fetch_channel(ucid, db, pull_all_videos = true, locale = nil)
   url = produce_channel_videos_url(ucid, page, auto_generated: auto_generated)
   response = YT_POOL.client &.get(url)
 
+  videos = [] of SearchVideo
   begin
-    json = JSON.parse(response.body)
+    initial_data = JSON.parse(response.body).as_a.find &.["response"]?
+    raise "Could not extract JSON" if !initial_data
+    videos = extract_videos(initial_data.as_h, author, ucid)
   rescue ex
     if response.body.includes?("To continue with your YouTube experience, please fill out the form below.") ||
        response.body.includes?("https://www.google.com/sorry/index")
       raise "Could not extract channel info. Instance is likely blocked."
     end
-
-    raise "Could not extract JSON"
   end
-
-  if json["content_html"]? && !json["content_html"].as_s.empty?
-    document = XML.parse_html(json["content_html"].as_s)
-    nodeset = document.xpath_nodes(%q(//li[contains(@class, "feed-item-container")]))
-
-    if auto_generated
-      videos = extract_videos(nodeset)
-    else
-      videos = extract_videos(nodeset, ucid, author)
-    end
-  end
-
-  videos ||= [] of ChannelVideo
 
   rss.xpath_nodes("//feed/entry").each do |entry|
     video_id = entry.xpath_node("videoid").not_nil!.content
@@ -260,18 +248,18 @@ def fetch_channel(ucid, db, pull_all_videos = true, locale = nil)
 
     premiere_timestamp = channel_video.try &.premiere_timestamp
 
-    video = ChannelVideo.new(
-      id: video_id,
-      title: title,
-      published: published,
-      updated: Time.utc,
-      ucid: ucid,
-      author: author,
-      length_seconds: length_seconds,
-      live_now: live_now,
+    video = ChannelVideo.new({
+      id:                 video_id,
+      title:              title,
+      published:          published,
+      updated:            Time.utc,
+      ucid:               ucid,
+      author:             author,
+      length_seconds:     length_seconds,
+      live_now:           live_now,
       premiere_timestamp: premiere_timestamp,
-      views: views,
-    )
+      views:              views,
+    })
 
     emails = db.query_all("UPDATE users SET notifications = array_append(notifications, $1) \
       WHERE updated < $2 AND $3 = ANY(subscriptions) AND $1 <> ALL(notifications) RETURNING email",
@@ -305,36 +293,23 @@ def fetch_channel(ucid, db, pull_all_videos = true, locale = nil)
     loop do
       url = produce_channel_videos_url(ucid, page, auto_generated: auto_generated)
       response = YT_POOL.client &.get(url)
-      json = JSON.parse(response.body)
+      initial_data = JSON.parse(response.body).as_a.find &.["response"]?
+      raise "Could not extract JSON" if !initial_data
+      videos = extract_videos(initial_data.as_h, author, ucid)
 
-      if json["content_html"]? && !json["content_html"].as_s.empty?
-        document = XML.parse_html(json["content_html"].as_s)
-        nodeset = document.xpath_nodes(%q(//li[contains(@class, "feed-item-container")]))
-      else
-        break
-      end
-
-      nodeset = nodeset.not_nil!
-
-      if auto_generated
-        videos = extract_videos(nodeset)
-      else
-        videos = extract_videos(nodeset, ucid, author)
-      end
-
-      count = nodeset.size
-      videos = videos.map { |video| ChannelVideo.new(
-        id: video.id,
-        title: video.title,
-        published: video.published,
-        updated: Time.utc,
-        ucid: video.ucid,
-        author: video.author,
-        length_seconds: video.length_seconds,
-        live_now: video.live_now,
+      count = videos.size
+      videos = videos.map { |video| ChannelVideo.new({
+        id:                 video.id,
+        title:              video.title,
+        published:          video.published,
+        updated:            Time.utc,
+        ucid:               video.ucid,
+        author:             video.author,
+        length_seconds:     video.length_seconds,
+        live_now:           video.live_now,
         premiere_timestamp: video.premiere_timestamp,
-        views: video.views
-      ) }
+        views:              video.views,
+      }) }
 
       videos.each do |video|
         ids << video.id
@@ -377,7 +352,13 @@ def fetch_channel(ucid, db, pull_all_videos = true, locale = nil)
     db.exec("DELETE FROM channel_videos * WHERE NOT id = ANY ('{#{ids.map { |id| %("#{id}") }.join(",")}}') AND ucid = $1", ucid)
   end
 
-  channel = InvidiousChannel.new(ucid, author, Time.utc, false, nil)
+  channel = InvidiousChannel.new({
+    id:         ucid,
+    author:     author,
+    updated:    Time.utc,
+    deleted:    false,
+    subscribed: nil,
+  })
 
   return channel
 end
@@ -387,23 +368,11 @@ def fetch_channel_playlists(ucid, author, auto_generated, continuation, sort_by)
     url = produce_channel_playlists_url(ucid, continuation, sort_by, auto_generated)
 
     response = YT_POOL.client &.get(url)
-    json = JSON.parse(response.body)
 
-    if json["load_more_widget_html"].as_s.empty?
-      continuation = nil
-    else
-      continuation = XML.parse_html(json["load_more_widget_html"].as_s)
-      continuation = continuation.xpath_node(%q(//button[@data-uix-load-more-href]))
-
-      if continuation
-        continuation = extract_channel_playlists_cursor(continuation["data-uix-load-more-href"], auto_generated)
-      end
-    end
-
-    html = XML.parse_html(json["content_html"].as_s)
-    nodeset = html.xpath_nodes(%q(//li[contains(@class, "feed-item-container")]))
+    continuation = response.body.match(/"continuation":"(?<continuation>[^"]+)"/).try &.["continuation"]?
+    initial_data = JSON.parse(response.body).as_a.find(&.["response"]?).try &.as_h
   else
-    url = "/channel/#{ucid}/playlists?disable_polymer=1&flow=list&view=1"
+    url = "/channel/#{ucid}/playlists?flow=list&view=1"
 
     case sort_by
     when "last", "last_added"
@@ -416,21 +385,13 @@ def fetch_channel_playlists(ucid, author, auto_generated, continuation, sort_by)
     end
 
     response = YT_POOL.client &.get(url)
-    html = XML.parse_html(response.body)
-
-    continuation = html.xpath_node(%q(//button[@data-uix-load-more-href]))
-    if continuation
-      continuation = extract_channel_playlists_cursor(continuation["data-uix-load-more-href"], auto_generated)
-    end
-
-    nodeset = html.xpath_nodes(%q(//ul[@id="browse-items-primary"]/li[contains(@class, "feed-item-container")]))
+    continuation = response.body.match(/"continuation":"(?<continuation>[^"]+)"/).try &.["continuation"]?
+    initial_data = extract_initial_data(response.body)
   end
 
-  if auto_generated
-    items = extract_shelf_items(nodeset, ucid, author)
-  else
-    items = extract_items(nodeset, ucid, author)
-  end
+  return [] of SearchItem, nil if !initial_data
+  items = extract_items(initial_data)
+  continuation = extract_channel_playlists_cursor(continuation, auto_generated) if continuation
 
   return items, continuation
 end
@@ -440,12 +401,12 @@ def produce_channel_videos_url(ucid, page = 1, auto_generated = nil, sort_by = "
     "80226972:embedded" => {
       "2:string" => ucid,
       "3:base64" => {
-        "2:string" => "videos",
-        "6:varint":   2_i64,
-        "7:varint":   1_i64,
-        "12:varint":  1_i64,
-        "13:string":  "",
-        "23:varint":  0_i64,
+        "2:string"  => "videos",
+        "6:varint"  => 2_i64,
+        "7:varint"  => 1_i64,
+        "12:varint" => 1_i64,
+        "13:string" => "",
+        "23:varint" => 0_i64,
       },
     },
   }
@@ -489,12 +450,12 @@ def produce_channel_playlists_url(ucid, cursor, sort = "newest", auto_generated 
     "80226972:embedded" => {
       "2:string" => ucid,
       "3:base64" => {
-        "2:string" => "playlists",
-        "6:varint":   2_i64,
-        "7:varint":   1_i64,
-        "12:varint":  1_i64,
-        "13:string":  "",
-        "23:varint":  0_i64,
+        "2:string"  => "playlists",
+        "6:varint"  => 2_i64,
+        "7:varint"  => 1_i64,
+        "12:varint" => 1_i64,
+        "13:string" => "",
+        "23:varint" => 0_i64,
       },
     },
   }
@@ -530,9 +491,8 @@ def produce_channel_playlists_url(ucid, cursor, sort = "newest", auto_generated 
   return "/browse_ajax?continuation=#{continuation}&gl=US&hl=en"
 end
 
-def extract_channel_playlists_cursor(url, auto_generated)
-  cursor = URI.parse(url).query_params
-    .try { |i| URI.decode_www_form(i["continuation"]) }
+def extract_channel_playlists_cursor(cursor, auto_generated)
+  cursor = URI.decode_www_form(cursor)
     .try { |i| Base64.decode(i) }
     .try { |i| IO::Memory.new(i) }
     .try { |i| Protodec::Any.parse(i) }
@@ -557,7 +517,7 @@ def extract_channel_playlists_cursor(url, auto_generated)
 end
 
 # TODO: Add "sort_by"
-def fetch_channel_community(ucid, continuation, locale, config, kemal_config, format, thin_mode)
+def fetch_channel_community(ucid, continuation, locale, format, thin_mode)
   response = YT_POOL.client &.get("/channel/#{ucid}/community?gl=US&hl=en")
   if response.status_code != 200
     response = YT_POOL.client &.get("/user/#{ucid}/community?gl=US&hl=en")
@@ -584,16 +544,8 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config, fo
 
     headers = HTTP::Headers.new
     headers["cookie"] = response.cookies.add_request_headers(headers)["cookie"]
-    headers["content-type"] = "application/x-www-form-urlencoded"
 
-    headers["x-client-data"] = "CIi2yQEIpbbJAQipncoBCNedygEIqKPKAQ=="
-    headers["x-spf-previous"] = ""
-    headers["x-spf-referer"] = ""
-
-    headers["x-youtube-client-name"] = "1"
-    headers["x-youtube-client-version"] = "2.20180719"
-
-    session_token = response.body.match(/"XSRF_TOKEN":"(?<session_token>[A-Za-z0-9\_\-\=]+)"/).try &.["session_token"]? || ""
+    session_token = response.body.match(/"XSRF_TOKEN":"(?<session_token>[^"]+)"/).try &.["session_token"]? || ""
     post_req = {
       session_token: session_token,
     }
@@ -633,13 +585,7 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config, fo
 
             next if !post
 
-            if !post["contentText"]?
-              content_html = ""
-            else
-              content_html = post["contentText"]["simpleText"]?.try &.as_s.rchop('\ufeff').try { |b| HTML.escape(b) }.to_s ||
-                             post["contentText"]["runs"]?.try &.as_a.try { |r| content_to_comment_html(r).try &.to_s } || ""
-            end
-
+            content_html = post["contentText"]?.try { |t| parse_content(t) } || ""
             author = post["authorText"]?.try &.["simpleText"]? || ""
 
             json.object do
@@ -708,7 +654,7 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config, fo
                         json.field "title", attachment["title"]["simpleText"].as_s
                         json.field "videoId", video_id
                         json.field "videoThumbnails" do
-                          generate_thumbnails(json, video_id, config, kemal_config)
+                          generate_thumbnails(json, video_id)
                         end
 
                         json.field "lengthSeconds", decode_length_seconds(attachment["lengthText"]["simpleText"].as_s)
@@ -909,12 +855,12 @@ def get_about_info(ucid, locale)
     related_author_thumbnail = node.xpath_node(%q(.//img)).try &.["data-thumb"]
     related_author_thumbnail ||= ""
 
-    AboutRelatedChannel.new(
-      ucid: related_id,
-      author: related_title,
-      author_url: related_author_url,
+    AboutRelatedChannel.new({
+      ucid:             related_id,
+      author:           related_title,
+      author_url:       related_author_url,
       author_thumbnail: related_author_thumbnail,
-    )
+    })
   end
 
   joined = about.xpath_node(%q(//span[contains(., "Joined")]))
@@ -936,68 +882,46 @@ def get_about_info(ucid, locale)
 
   tabs = about.xpath_nodes(%q(//ul[@id="channel-navigation-menu"]/li/a/span)).map { |node| node.content.downcase }
 
-  AboutChannel.new(
-    ucid: ucid,
-    author: author,
-    auto_generated: auto_generated,
-    author_url: author_url,
-    author_thumbnail: author_thumbnail,
-    banner: banner,
-    description_html: description_html,
-    paid: paid,
-    total_views: total_views,
-    sub_count: sub_count,
-    joined: joined,
+  AboutChannel.new({
+    ucid:               ucid,
+    author:             author,
+    auto_generated:     auto_generated,
+    author_url:         author_url,
+    author_thumbnail:   author_thumbnail,
+    banner:             banner,
+    description_html:   description_html,
+    paid:               paid,
+    total_views:        total_views,
+    sub_count:          sub_count,
+    joined:             joined,
     is_family_friendly: is_family_friendly,
-    allowed_regions: allowed_regions,
-    related_channels: related_channels,
-    tabs: tabs
-  )
+    allowed_regions:    allowed_regions,
+    related_channels:   related_channels,
+    tabs:               tabs,
+  })
 end
 
 def get_60_videos(ucid, author, page, auto_generated, sort_by = "newest")
-  count = 0
   videos = [] of SearchVideo
 
   2.times do |i|
     url = produce_channel_videos_url(ucid, page * 2 + (i - 1), auto_generated: auto_generated, sort_by: sort_by)
     response = YT_POOL.client &.get(url)
-    json = JSON.parse(response.body)
-
-    if json["content_html"]? && !json["content_html"].as_s.empty?
-      document = XML.parse_html(json["content_html"].as_s)
-      nodeset = document.xpath_nodes(%q(//li[contains(@class, "feed-item-container")]))
-
-      if !json["load_more_widget_html"]?.try &.as_s.empty?
-        count += 30
-      end
-
-      if auto_generated
-        videos += extract_videos(nodeset)
-      else
-        videos += extract_videos(nodeset, ucid, author)
-      end
-    else
-      break
-    end
+    initial_data = JSON.parse(response.body).as_a.find &.["response"]?
+    break if !initial_data
+    videos.concat extract_videos(initial_data.as_h, author, ucid)
   end
 
-  return videos, count
+  return videos.size, videos
 end
 
 def get_latest_videos(ucid)
-  videos = [] of SearchVideo
-
   url = produce_channel_videos_url(ucid, 0)
   response = YT_POOL.client &.get(url)
-  json = JSON.parse(response.body)
+  initial_data = JSON.parse(response.body).as_a.find &.["response"]?
+  return [] of SearchVideo if !initial_data
+  author = initial_data["response"]?.try &.["metadata"]?.try &.["channelMetadataRenderer"]?.try &.["title"]?.try &.as_s
+  items = extract_videos(initial_data.as_h, author, ucid)
 
-  if json["content_html"]? && !json["content_html"].as_s.empty?
-    document = XML.parse_html(json["content_html"].as_s)
-    nodeset = document.xpath_nodes(%q(//li[contains(@class, "feed-item-container")]))
-
-    videos = extract_videos(nodeset, ucid)
-  end
-
-  return videos
+  return items
 end

@@ -2,13 +2,16 @@ require "lsquic"
 require "pool/connection"
 
 def add_yt_headers(request)
-  request.headers["x-youtube-client-name"] ||= "1"
-  request.headers["x-youtube-client-version"] ||= "1.20180719"
   request.headers["user-agent"] ||= "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.97 Safari/537.36"
   request.headers["accept-charset"] ||= "ISO-8859-1,utf-8;q=0.7,*;q=0.7"
   request.headers["accept"] ||= "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
   request.headers["accept-language"] ||= "en-us,en;q=0.5"
-  request.headers["cookie"] = "#{(CONFIG.cookies.map { |c| "#{c.name}=#{c.value}" }).join("; ")}; #{request.headers["cookie"]?}"
+  return if request.resource.starts_with? "/sorry/index"
+  request.headers["x-youtube-client-name"] ||= "1"
+  request.headers["x-youtube-client-version"] ||= "2.20200609"
+  if !CONFIG.cookies.empty?
+    request.headers["cookie"] = "#{(CONFIG.cookies.map { |c| "#{c.name}=#{c.value}" }).join("; ")}; #{request.headers["cookie"]?}"
+  end
 end
 
 struct QUICPool
@@ -329,7 +332,7 @@ end
 def sha256(text)
   digest = OpenSSL::Digest.new("SHA256")
   digest << text
-  return digest.hexdigest
+  return digest.final.hexstring
 end
 
 def subscribe_pubsub(topic, key, config)
@@ -348,10 +351,8 @@ def subscribe_pubsub(topic, key, config)
   nonce = Random::Secure.hex(4)
   signature = "#{time}:#{nonce}"
 
-  host_url = make_host_url(config, Kemal.config)
-
   body = {
-    "hub.callback"      => "#{host_url}/feed/webhook/v1:#{time}:#{nonce}:#{OpenSSL::HMAC.hexdigest(:sha1, key, signature)}",
+    "hub.callback"      => "#{HOST_URL}/feed/webhook/v1:#{time}:#{nonce}:#{OpenSSL::HMAC.hexdigest(:sha1, key, signature)}",
     "hub.topic"         => "https://www.youtube.com/xml/feeds/videos.xml?#{topic}",
     "hub.verify"        => "async",
     "hub.mode"          => "subscribe",

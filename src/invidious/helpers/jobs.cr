@@ -67,7 +67,7 @@ def refresh_feeds(db, logger, config)
             begin
               # Drop outdated views
               column_array = get_column_array(db, view_name)
-              ChannelVideo.to_type_tuple.each_with_index do |name, i|
+              ChannelVideo.type_array.each_with_index do |name, i|
                 if name != column_array[i]?
                   logger.puts("DROP MATERIALIZED VIEW #{view_name}")
                   db.exec("DROP MATERIALIZED VIEW #{view_name}")
@@ -170,41 +170,6 @@ def subscribe_to_feeds(db, logger, key, config)
   end
 end
 
-def pull_top_videos(config, db)
-  loop do
-    begin
-      top = rank_videos(db, 40)
-    rescue ex
-      sleep 1.minute
-      Fiber.yield
-
-      next
-    end
-
-    if top.size == 0
-      sleep 1.minute
-      Fiber.yield
-
-      next
-    end
-
-    videos = [] of Video
-
-    top.each do |id|
-      begin
-        videos << get_video(id, db)
-      rescue ex
-        next
-      end
-    end
-
-    yield videos
-
-    sleep 1.minute
-    Fiber.yield
-  end
-end
-
 def pull_popular_videos(db)
   loop do
     videos = db.query_all("SELECT DISTINCT ON (ucid) * FROM channel_videos WHERE ucid IN \
@@ -225,6 +190,7 @@ def update_decrypt_function
       decrypt_function = fetch_decrypt_function
       yield decrypt_function
     rescue ex
+      # TODO: Log error
       next
     ensure
       sleep 1.minute
@@ -236,12 +202,13 @@ end
 def bypass_captcha(captcha_key, logger)
   loop do
     begin
-      {"/watch?v=CvFH_6DNRCY&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999", produce_channel_videos_url(ucid: "UCXuqSBlHAE6Xw-yeJA0Tunw")}.each do |path|
+      {"/watch?v=CvFH_6DNRCY&gl=US&hl=en&has_verified=1&bpctr=9999999999", produce_channel_videos_url(ucid: "UCXuqSBlHAE6Xw-yeJA0Tunw")}.each do |path|
         response = YT_POOL.client &.get(path)
         if response.body.includes?("To continue with your YouTube experience, please fill out the form below.")
           html = XML.parse_html(response.body)
           form = html.xpath_node(%(//form[@action="/das_captcha"])).not_nil!
-          site_key = form.xpath_node(%(.//div[@class="g-recaptcha"])).try &.["data-sitekey"]
+          site_key = form.xpath_node(%(.//div[@id="recaptcha"])).try &.["data-sitekey"]
+          s_value = form.xpath_node(%(.//div[@id="recaptcha"])).try &.["data-s"]
 
           inputs = {} of String => String
           form.xpath_nodes(%(.//input[@name])).map do |node|
@@ -253,16 +220,14 @@ def bypass_captcha(captcha_key, logger)
           response = JSON.parse(HTTP::Client.post("https://api.anti-captcha.com/createTask", body: {
             "clientKey" => CONFIG.captcha_key,
             "task"      => {
-              "type"       => "NoCaptchaTaskProxyless",
-              "websiteURL" => "https://www.youtube.com/watch?v=CvFH_6DNRCY&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999",
-              "websiteKey" => site_key,
+              "type"                => "NoCaptchaTaskProxyless",
+              "websiteURL"          => "https://www.youtube.com#{path}",
+              "websiteKey"          => site_key,
+              "recaptchaDataSValue" => s_value,
             },
           }.to_json).body)
 
-          if response["error"]?
-            raise response["error"].as_s
-          end
-
+          raise response["error"].as_s if response["error"]?
           task_id = response["taskId"].as_i
 
           loop do
@@ -281,42 +246,44 @@ def bypass_captcha(captcha_key, logger)
           end
 
           inputs["g-recaptcha-response"] = response["solution"]["gRecaptchaResponse"].as_s
+          headers["Cookies"] = response["solution"]["cookies"].as_h.map { |k, v| "#{k}=#{v}" }.join("; ")
           response = YT_POOL.client &.post("/das_captcha", headers, form: inputs)
 
           yield response.cookies.select { |cookie| cookie.name != "PREF" }
         elsif response.headers["Location"]?.try &.includes?("/sorry/index")
           location = response.headers["Location"].try { |u| URI.parse(u) }
-          client = QUIC::Client.new(location.host.not_nil!)
-          response = client.get(location.full_path)
+          headers = HTTP::Headers{":authority" => location.host.not_nil!}
+          response = YT_POOL.client &.get(location.full_path, headers)
 
           html = XML.parse_html(response.body)
           form = html.xpath_node(%(//form[@action="index"])).not_nil!
-          site_key = form.xpath_node(%(.//div[@class="g-recaptcha"])).try &.["data-sitekey"]
+          site_key = form.xpath_node(%(.//div[@id="recaptcha"])).try &.["data-sitekey"]
+          s_value = form.xpath_node(%(.//div[@id="recaptcha"])).try &.["data-s"]
 
           inputs = {} of String => String
           form.xpath_nodes(%(.//input[@name])).map do |node|
             inputs[node["name"]] = node["value"]
           end
 
-          response = JSON.parse(HTTP::Client.post("https://api.anti-captcha.com/createTask", body: {
+          captcha_client = HTTPClient.new(URI.parse("https://api.anti-captcha.com"))
+          captcha_client.family = CONFIG.force_resolve || Socket::Family::INET
+          response = JSON.parse(captcha_client.post("/createTask", body: {
             "clientKey" => CONFIG.captcha_key,
             "task"      => {
-              "type"       => "NoCaptchaTaskProxyless",
-              "websiteURL" => location.to_s,
-              "websiteKey" => site_key,
+              "type"                => "NoCaptchaTaskProxyless",
+              "websiteURL"          => location.to_s,
+              "websiteKey"          => site_key,
+              "recaptchaDataSValue" => s_value,
             },
           }.to_json).body)
 
-          if response["error"]?
-            raise response["error"].as_s
-          end
-
+          raise response["error"].as_s if response["error"]?
           task_id = response["taskId"].as_i
 
           loop do
             sleep 10.seconds
 
-            response = JSON.parse(HTTP::Client.post("https://api.anti-captcha.com/getTaskResult", body: {
+            response = JSON.parse(captcha_client.post("/getTaskResult", body: {
               "clientKey" => CONFIG.captcha_key,
               "taskId"    => task_id,
             }.to_json).body)
@@ -329,9 +296,8 @@ def bypass_captcha(captcha_key, logger)
           end
 
           inputs["g-recaptcha-response"] = response["solution"]["gRecaptchaResponse"].as_s
-          client.close
-          client = QUIC::Client.new("www.google.com")
-          response = client.post(location.full_path, form: inputs)
+          headers["Cookies"] = response["solution"]["cookies"].as_h.map { |k, v| "#{k}=#{v}" }.join("; ")
+          response = YT_POOL.client &.post("/sorry/index", headers: headers, form: inputs)
           headers = HTTP::Headers{
             "Cookie" => URI.parse(response.headers["location"]).query_params["google_abuse"].split(";")[0],
           }

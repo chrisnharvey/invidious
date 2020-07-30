@@ -1,11 +1,23 @@
 class RedditThing
-  JSON.mapping({
-    kind: String,
-    data: RedditComment | RedditLink | RedditMore | RedditListing,
-  })
+  include JSON::Serializable
+
+  property kind : String
+  property data : RedditComment | RedditLink | RedditMore | RedditListing
 end
 
 class RedditComment
+  include JSON::Serializable
+
+  property author : String
+  property body_html : String
+  property replies : RedditThing | String
+  property score : Int32
+  property depth : Int32
+  property permalink : String
+
+  @[JSON::Field(converter: RedditComment::TimeConverter)]
+  property created_utc : Time
+
   module TimeConverter
     def self.from_json(value : JSON::PullParser) : Time
       Time.unix(value.read_float.to_i)
@@ -15,51 +27,38 @@ class RedditComment
       json.number(value.to_unix)
     end
   end
-
-  JSON.mapping({
-    author:      String,
-    body_html:   String,
-    replies:     RedditThing | String,
-    score:       Int32,
-    depth:       Int32,
-    permalink:   String,
-    created_utc: {
-      type:      Time,
-      converter: RedditComment::TimeConverter,
-    },
-  })
 end
 
 struct RedditLink
-  JSON.mapping({
-    author:       String,
-    score:        Int32,
-    subreddit:    String,
-    num_comments: Int32,
-    id:           String,
-    permalink:    String,
-    title:        String,
-  })
+  include JSON::Serializable
+
+  property author : String
+  property score : Int32
+  property subreddit : String
+  property num_comments : Int32
+  property id : String
+  property permalink : String
+  property title : String
 end
 
 struct RedditMore
-  JSON.mapping({
-    children: Array(String),
-    count:    Int32,
-    depth:    Int32,
-  })
+  include JSON::Serializable
+
+  property children : Array(String)
+  property count : Int32
+  property depth : Int32
 end
 
 class RedditListing
-  JSON.mapping({
-    children: Array(RedditThing),
-    modhash:  String,
-  })
+  include JSON::Serializable
+
+  property children : Array(RedditThing)
+  property modhash : String
 end
 
 def fetch_youtube_comments(id, db, cursor, format, locale, thin_mode, region, sort_by = "top")
   video = get_video(id, db, region: region)
-  session_token = video.info["session_token"]?
+  session_token = video.session_token
 
   case cursor
   when nil, ""
@@ -85,17 +84,9 @@ def fetch_youtube_comments(id, db, cursor, format, locale, thin_mode, region, so
     session_token: session_token,
   }
 
-  headers = HTTP::Headers.new
-
-  headers["content-type"] = "application/x-www-form-urlencoded"
-  headers["cookie"] = video.info["cookie"]
-
-  headers["x-client-data"] = "CIi2yQEIpbbJAQipncoBCNedygEIqKPKAQ=="
-  headers["x-spf-previous"] = "https://www.youtube.com/watch?v=#{id}&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999"
-  headers["x-spf-referer"] = "https://www.youtube.com/watch?v=#{id}&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999"
-
-  headers["x-youtube-client-name"] = "1"
-  headers["x-youtube-client-version"] = "2.20180719"
+  headers = HTTP::Headers{
+    "cookie" => video.cookie,
+  }
 
   response = YT_POOL.client(region, &.post("/comment_service_ajax?action_get_comments=1&hl=en&gl=US", headers, form: post_req))
   response = JSON.parse(response.body)
@@ -150,8 +141,7 @@ def fetch_youtube_comments(id, db, cursor, format, locale, thin_mode, region, so
                 node_comment = node["commentRenderer"]
               end
 
-              content_html = node_comment["contentText"]["simpleText"]?.try &.as_s.rchop('\ufeff').try { |b| HTML.escape(b) }.to_s ||
-                             node_comment["contentText"]["runs"]?.try &.as_a.try { |r| content_to_comment_html(r).try &.to_s } || ""
+              content_html = node_comment["contentText"]?.try { |t| parse_content(t) } || ""
               author = node_comment["authorText"]?.try &.["simpleText"]? || ""
 
               json.field "author", author
@@ -521,6 +511,11 @@ def fill_links(html, scheme, host)
   end
 
   return html.to_xml(options: XML::SaveOptions::NO_DECL)
+end
+
+def parse_content(content : JSON::Any) : String
+  content["simpleText"]?.try &.as_s.rchop('\ufeff').try { |b| HTML.escape(b) }.to_s ||
+    content["runs"]?.try &.as_a.try { |r| content_to_comment_html(r).try &.to_s } || ""
 end
 
 def content_to_comment_html(content)
